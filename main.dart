@@ -18,10 +18,11 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // ============================================================================
-// POINT D'ENTRÉE DE L'APPLICATION & VERROUILLAGE KIOSQUE
+// POINT D'ENTRÉE & VERROUILLAGE KIOSQUE PORTRAIT
 // ============================================================================
 
 List<CameraDescription> globalAvailableCameras = [];
@@ -29,15 +30,12 @@ List<CameraDescription> globalAvailableCameras = [];
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Verrouillage strict en orientation Portrait (tablette iPad & Android)
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
   ]);
 
-  // Activation du mode plein écran immersif (Kiosque sans barre de navigation système)
   await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
-  // Récupération de la liste des caméras matérielles disponibles
   try {
     globalAvailableCameras = await availableCameras();
   } catch (e) {
@@ -48,7 +46,7 @@ Future<void> main() async {
 }
 
 // ============================================================================
-// THÈME VISUEL HALLOWEEN & APPLICATION RACINE
+// THÈME VISUEL HALLOWEEN
 // ============================================================================
 
 class HalloweenColors {
@@ -86,16 +84,16 @@ class HalloweenPhotoboothApp extends StatelessWidget {
 }
 
 // ============================================================================
-// MODÈLES DE DONNÉES (CONFIGURATION, CADRES PNG, FILE D'ATTENTE CLOUD)
+// MODÈLES DE DONNÉES
 // ============================================================================
 
-/// Modèle représentant la configuration administrateur persistée
 class BoothConfig {
   final String webhookUrl;
-  final int countdownSeconds; // 3, 5 ou 10 secondes
+  final int countdownSeconds;
   final bool useFrontCamera;
   final bool isMirrored;
   final String adminPin;
+  final int resultDurationSeconds;
 
   const BoothConfig({
     this.webhookUrl = '',
@@ -103,6 +101,7 @@ class BoothConfig {
     this.useFrontCamera = true,
     this.isMirrored = true,
     this.adminPin = '1031',
+    this.resultDurationSeconds = 12,
   });
 
   BoothConfig copyWith({
@@ -111,6 +110,7 @@ class BoothConfig {
     bool? useFrontCamera,
     bool? isMirrored,
     String? adminPin,
+    int? resultDurationSeconds,
   }) {
     return BoothConfig(
       webhookUrl: webhookUrl ?? this.webhookUrl,
@@ -118,11 +118,11 @@ class BoothConfig {
       useFrontCamera: useFrontCamera ?? this.useFrontCamera,
       isMirrored: isMirrored ?? this.isMirrored,
       adminPin: adminPin ?? this.adminPin,
+      resultDurationSeconds: resultDurationSeconds ?? this.resultDurationSeconds,
     );
   }
 }
 
-/// Modèle représentant un cadre décoratif PNG avec transparence
 class FrameItem {
   final String id;
   final String title;
@@ -137,7 +137,6 @@ class FrameItem {
   });
 }
 
-/// Payload transmis à l'Isolate de traitement d'image en arrière-plan
 class ImageMergeJob {
   final Uint8List rawPhotoBytes;
   final Uint8List framePngBytes;
@@ -153,37 +152,30 @@ class ImageMergeJob {
 }
 
 // ============================================================================
-// MOTEUR DE FUSION MATRICIELLE PIXEL-PERFECT (EXÉCUTÉ EN ISOLATE)
+// MOTEUR DE FUSION MATRICIELLE PIXEL-PERFECT (ISOLATE)
 // ============================================================================
 
-/// Fonction top-level exécutée dans un Isolate séparé via `compute()`
-/// pour ne jamais bloquer le thread UI pendant le traitement haute résolution.
 Uint8List processAndMergePhotoIsolate(ImageMergeJob job) {
-  // 1. Décodage de l'image brute issue du capteur caméra
   img.Image? capturedImage = img.decodeImage(job.rawPhotoBytes);
   if (capturedImage == null) {
-    throw Exception('Impossible de décoder la photo brute capturée.');
+    throw Exception('Impossible de décoder la photo brute.');
   }
 
-  // Correction automatique de l'orientation EXIF matérielle
   capturedImage = img.bakeOrientation(capturedImage);
 
-  // Application de l'effet miroir horizontal si activé
   if (job.flipHorizontally) {
     capturedImage = img.flipHorizontal(capturedImage);
   }
 
-  // 2. Décodage du cadre PNG sélectionné à sa résolution native
   img.Image? frameImage = img.decodePng(job.framePngBytes);
   if (frameImage == null) {
-    throw Exception('Impossible de décoder le cadre PNG sélectionné.');
+    throw Exception('Impossible de décoder le cadre PNG.');
   }
 
   final int targetWidth = frameImage.width;
   final int targetHeight = frameImage.height;
   final double targetAspect = targetWidth / targetHeight;
 
-  // 3. Calcul du recadrage centré (Center-Crop) pour respecter le ratio exact du cadre (ex: 3:4)
   final int srcWidth = capturedImage.width;
   final int srcHeight = capturedImage.height;
   final double srcAspect = srcWidth / srcHeight;
@@ -194,11 +186,9 @@ Uint8List processAndMergePhotoIsolate(ImageMergeJob job) {
   int cropY = 0;
 
   if (srcAspect > targetAspect) {
-    // L'image source est plus large que le cadre : on recadre les côtés gauche/droite
     cropWidth = (srcHeight * targetAspect).round();
     cropX = ((srcWidth - cropWidth) / 2).round();
   } else if (srcAspect < targetAspect) {
-    // L'image source est plus haute que le cadre : on recadre le haut/bas
     cropHeight = (srcWidth / targetAspect).round();
     cropY = ((srcHeight - cropHeight) / 2).round();
   }
@@ -211,7 +201,6 @@ Uint8List processAndMergePhotoIsolate(ImageMergeJob job) {
     height: cropHeight,
   );
 
-  // 4. Redimensionnement matriciel de la photo aux dimensions exactes du cadre PNG
   final img.Image canvas = img.copyResize(
     croppedPhoto,
     width: targetWidth,
@@ -219,7 +208,6 @@ Uint8List processAndMergePhotoIsolate(ImageMergeJob job) {
     interpolation: img.Interpolation.linear,
   );
 
-  // 5. Superposition pixel-perfect du cadre PNG avec transparence Alpha
   img.compositeImage(
     canvas,
     frameImage,
@@ -228,12 +216,11 @@ Uint8List processAndMergePhotoIsolate(ImageMergeJob job) {
     blend: img.BlendMode.alpha,
   );
 
-  // 6. Exportation finale en JPEG haute qualité (95 %)
   return Uint8List.fromList(img.encodeJpg(canvas, quality: job.jpegQuality));
 }
 
 // ============================================================================
-// GESTIONNAIRE DE RESSOURCES (CADRES PNG ASSETS + GÉNÉRATEUR DE SECOURS)
+// GESTION DES RESSOURCES & CADRES PNG DE SECOURS
 // ============================================================================
 
 class FrameAssetsManager {
@@ -260,9 +247,6 @@ class FrameAssetsManager {
     },
   ];
 
-  /// Charge les cadres PNG depuis `assets/frames/`.
-  /// Si un fichier n'est pas trouvé dans le bundle, génère automatiquement un cadre
-  /// PNG transparent 3:4 haute définition en mémoire pour garantir un fonctionnement immédiat.
   static Future<List<FrameItem>> loadAllFrames() async {
     final List<FrameItem> loaded = [];
 
@@ -274,7 +258,6 @@ class FrameAssetsManager {
         final ByteData data = await rootBundle.load(item['path']!);
         bytes = data.buffer.asUint8List();
       } catch (_) {
-        // Génération automatique d'un cadre PNG transparent 3:4 (900x1200) de secours
         bytes = await compute(_generateFallbackHalloweenFrameIsolate, i);
       }
 
@@ -291,33 +274,30 @@ class FrameAssetsManager {
     return loaded;
   }
 
-  /// Génère un cadre PNG transparent 3:4 (900x1200) thématisé Halloween
   static Uint8List _generateFallbackHalloweenFrameIsolate(int styleIndex) {
     const int width = 900;
     const int height = 1200;
     final img.Image frame = img.Image(width: width, height: height, numChannels: 4);
 
-    // Fond 100% transparent
     img.fill(frame, color: img.ColorRgba8(0, 0, 0, 0));
 
-    // Palette selon le style choisi
     late final img.ColorRgba8 primaryColor;
     late final img.ColorRgba8 secondaryColor;
 
     switch (styleIndex % 4) {
-      case 0: // Citrouille Orange & Noir
+      case 0:
         primaryColor = img.ColorRgba8(255, 117, 24, 255);
         secondaryColor = img.ColorRgba8(43, 17, 63, 235);
         break;
-      case 1: // Toile Violet Mystique & Argent
+      case 1:
         primaryColor = img.ColorRgba8(138, 43, 226, 255);
         secondaryColor = img.ColorRgba8(220, 220, 235, 220);
         break;
-      case 2: // Vampire Rouge Sang & Or Sombre
+      case 2:
         primaryColor = img.ColorRgba8(190, 15, 45, 255);
         secondaryColor = img.ColorRgba8(255, 185, 50, 230);
         break;
-      default: // Sorcière Vert Poison & Violet
+      default:
         primaryColor = img.ColorRgba8(57, 255, 20, 255);
         secondaryColor = img.ColorRgba8(55, 15, 85, 240);
         break;
@@ -326,7 +306,6 @@ class FrameAssetsManager {
     const int border = 36;
     const int footerHeight = 140;
 
-    // Bordures extérieures du cadre
     img.fillRect(frame, x1: 0, y1: 0, x2: width, y2: border, color: primaryColor);
     img.fillRect(
         frame, x1: 0, y1: height - footerHeight, x2: width, y2: height, color: secondaryColor);
@@ -334,7 +313,6 @@ class FrameAssetsManager {
     img.fillRect(
         frame, x1: width - border, y1: 0, x2: width, y2: height, color: primaryColor);
 
-    // Liseré interne décoratif
     img.drawRect(
       frame,
       x1: border + 8,
@@ -345,7 +323,6 @@ class FrameAssetsManager {
       thickness: 4,
     );
 
-    // Motifs de toiles d'araignée dans les coins supérieurs
     for (int r = 40; r <= 160; r += 40) {
       img.drawLine(
         frame,
@@ -367,23 +344,6 @@ class FrameAssetsManager {
       );
     }
 
-    // Médaillons décoratifs dans le bandeau inférieur
-    img.fillCircle(
-      frame,
-      x: 110,
-      y: height - (footerHeight ~/ 2),
-      radius: 38,
-      color: primaryColor,
-    );
-    img.fillCircle(
-      frame,
-      x: width - 110,
-      y: height - (footerHeight ~/ 2),
-      radius: 38,
-      color: primaryColor,
-    );
-
-    // Texte graphique "HALLOWEEN PARTY" dans le bandeau inférieur (police bitmap intégrée)
     img.drawString(
       frame,
       'HALLOWEEN PHOTOBOOTH',
@@ -398,7 +358,7 @@ class FrameAssetsManager {
 }
 
 // ============================================================================
-// SERVICE AUDIO (EFFETS SONORES DE DÉCOMPTE ET D'OBTURATEUR)
+// SERVICE AUDIO
 // ============================================================================
 
 class SoundEffectsService {
@@ -421,9 +381,7 @@ class SoundEffectsService {
       } catch (_) {
         await _beepPlayer.play(BytesSource(_beepWavBytes));
       }
-    } catch (e) {
-      debugPrint('Avertissement audio (bip) : $e');
-    }
+    } catch (_) {}
   }
 
   Future<void> playShutterSound() async {
@@ -434,12 +392,9 @@ class SoundEffectsService {
       } catch (_) {
         await _shutterPlayer.play(BytesSource(_shutterWavBytes));
       }
-    } catch (e) {
-      debugPrint('Avertissement audio (obturateur) : $e');
-    }
+    } catch (_) {}
   }
 
-  /// Génère un fichier WAV PCM 16-bit 44.1 kHz en mémoire pour le bip du compte à rebours
   Uint8List _generateSineWaveWav({required double frequencyHz, required int durationMs}) {
     const int sampleRate = 44100;
     final int numSamples = ((sampleRate * durationMs) / 1000).round();
@@ -459,7 +414,6 @@ class SoundEffectsService {
     return buffer.buffer.asUint8List();
   }
 
-  /// Génère un bruit mécanique d'obturateur photo en WAV PCM 16-bit
   Uint8List _generateShutterWav({required int durationMs}) {
     const int sampleRate = 44100;
     final int numSamples = ((sampleRate * durationMs) / 1000).round();
@@ -471,7 +425,6 @@ class SoundEffectsService {
 
     for (int i = 0; i < numSamples; i++) {
       final double progress = i / numSamples;
-      // Double clic mécanique caractéristique d'un obturateur reflex
       final double burst = (progress < 0.25 || (progress > 0.55 && progress < 0.75))
           ? (1.0 - (progress % 0.25) * 4.0)
           : 0.05;
@@ -496,13 +449,13 @@ class SoundEffectsService {
       buffer.setUint8(36 + i, data[i]);
     }
     buffer.setUint32(4, 36 + dataSize, Endian.little);
-    buffer.setUint32(16, 16, Endian.little); // PCM chunk size
-    buffer.setUint16(20, 1, Endian.little); // AudioFormat PCM = 1
-    buffer.setUint16(22, 1, Endian.little); // Mono = 1 canal
+    buffer.setUint32(16, 16, Endian.little);
+    buffer.setUint16(20, 1, Endian.little);
+    buffer.setUint16(22, 1, Endian.little);
     buffer.setUint32(24, sampleRate, Endian.little);
-    buffer.setUint32(28, sampleRate * 2, Endian.little); // ByteRate
-    buffer.setUint16(32, 2, Endian.little); // BlockAlign
-    buffer.setUint16(34, 16, Endian.little); // BitsPerSample
+    buffer.setUint32(28, sampleRate * 2, Endian.little);
+    buffer.setUint16(32, 2, Endian.little);
+    buffer.setUint16(34, 16, Endian.little);
     buffer.setUint32(40, dataSize, Endian.little);
   }
 
@@ -513,15 +466,12 @@ class SoundEffectsService {
 }
 
 // ============================================================================
-// SERVICE DE SAUVEGARDE GALERIE LOCALE & SYNCHRONISATION CLOUD GOOGLE DRIVE
+// SERVICE STOCKAGE & SYNCHRONISATION CLOUD GOOGLE DRIVE AVEC RETOUR D'URL
 // ============================================================================
 
 class StorageAndCloudService {
   static const String _queuePrefsKey = 'halloween_offline_upload_queue';
-  static const MethodChannel _mediaScannerChannel =
-      MethodChannel('com.piratepips.photobooth/media_scanner');
 
-  /// Sauvegarde asynchrone du JPEG dans la galerie/pellicule locale sans bloquer l'UI
   static Future<File> savePhotoToLocalGallery(
     Uint8List jpegBytes,
     String fileName,
@@ -535,7 +485,6 @@ class StorageAndCloudService {
     final File localFile = File('${localPhotosDir.path}/$fileName');
     await localFile.writeAsBytes(jpegBytes, flush: true);
 
-    // Sur Android : copie additionnelle dans le dossier public Pictures/DCIM pour visibilité immédiate dans la Galerie
     if (Platform.isAndroid) {
       try {
         final Directory publicDir = Directory('/storage/emulated/0/Pictures/HalloweenPhotobooth');
@@ -544,55 +493,23 @@ class StorageAndCloudService {
         }
         final File galleryFile = File('${publicDir.path}/$fileName');
         await galleryFile.writeAsBytes(jpegBytes, flush: true);
-
-        // Notification optionnelle au MediaScanner Android
-        try {
-          await _mediaScannerChannel.invokeMethod('scanFile', {'path': galleryFile.path});
-        } catch (_) {}
-      } catch (e) {
-        debugPrint('Sauvegarde galerie publique secondaire ignorée : $e');
-      }
+      } catch (_) {}
     }
 
     return localFile;
   }
 
-  /// Envoie la photo en Base64 vers le Webhook Google Apps Script.
-  /// En cas d'absence de réseau ou d'échec, place le fichier en file d'attente locale silencieusement.
-  static Future<void> uploadOrQueuePhoto({
+  /// Téléverse la photo et renvoie l'URL publique de téléchargement/visualisation
+  /// en suivant la redirection HTTP 302 native de Google Apps Script.
+  static Future<String?> uploadAndRetrieveDirectUrl({
     required File photoFile,
     required String fileName,
     required String webhookUrl,
   }) async {
-    if (webhookUrl.trim().isEmpty) {
-      return;
-    }
+    if (webhookUrl.trim().isEmpty) return null;
 
-    final bool sent = await _sendFileToWebhook(
-      filePath: photoFile.path,
-      fileName: fileName,
-      webhookUrl: webhookUrl.trim(),
-    );
-
-    if (!sent) {
-      await _enqueueOfflinePhoto(photoFile.path, fileName);
-    } else {
-      // Si le réseau fonctionne, on tente d'écouler la file d'attente existante en tâche de fond
-      unawaited(flushOfflineQueue(webhookUrl.trim()));
-    }
-  }
-
-  /// Requête HTTP POST vers Google Apps Script (gère nativement les redirections HTTP 302 de Google)
-  static Future<bool> _sendFileToWebhook({
-    required String filePath,
-    required String fileName,
-    required String webhookUrl,
-  }) async {
     try {
-      final File file = File(filePath);
-      if (!await file.exists()) return true;
-
-      final Uint8List bytes = await file.readAsBytes();
+      final Uint8List bytes = await photoFile.readAsBytes();
       final String base64Image = base64Encode(bytes);
 
       final String payload = jsonEncode({
@@ -600,27 +517,49 @@ class StorageAndCloudService {
         'filename': fileName,
       });
 
-      final http.Response response = await http
-          .post(
-            Uri.parse(webhookUrl),
-            headers: {'Content-Type': 'application/json'},
-            body: payload,
-          )
-          .timeout(const Duration(seconds: 25));
+      final client = http.Client();
+      final request = http.Request('POST', Uri.parse(webhookUrl.trim()))
+        ..headers['Content-Type'] = 'application/json'
+        ..body = payload
+        ..followRedirects = false;
 
-      // Google Apps Script renvoie souvent un code 302 (redirection vers script.googleusercontent.com)
-      // lorsque l'exécution du script doPost(e) a réussi.
-      if (response.statusCode == 200 ||
-          response.statusCode == 201 ||
-          response.statusCode == 302) {
-        return true;
+      final streamedResponse =
+          await client.send(request).timeout(const Duration(seconds: 25));
+      final response = await http.Response.fromStream(streamedResponse);
+
+      // Traitement de la redirection HTTP 302 spécifique à Google Apps Script
+      if (response.statusCode == 302 ||
+          response.statusCode == 301 ||
+          response.statusCode == 307) {
+        final String? redirectUrl = response.headers['location'];
+        if (redirectUrl != null && redirectUrl.isNotEmpty) {
+          final getResponse = await client
+              .get(Uri.parse(redirectUrl))
+              .timeout(const Duration(seconds: 15));
+          if (getResponse.statusCode == 200) {
+            final Map<String, dynamic> data =
+                jsonDecode(getResponse.body) as Map<String, dynamic>;
+            if (data['status'] == 'success' && data['url'] != null) {
+              return data['url'] as String;
+            }
+          }
+        }
+      } else if (response.statusCode == 200 || response.statusCode == 201) {
+        final Map<String, dynamic> data =
+            jsonDecode(response.body) as Map<String, dynamic>;
+        if (data['status'] == 'success' && data['url'] != null) {
+          return data['url'] as String;
+        }
       }
 
-      return false;
+      // Si échec du retour direct, mise en file d'attente
+      await _enqueueOfflinePhoto(photoFile.path, fileName);
     } catch (e) {
-      debugPrint('Mise en file d\'attente hors-ligne suite à une erreur réseau : $e');
-      return false;
+      debugPrint('Mode hors-ligne ou erreur de synchronisation : $e');
+      await _enqueueOfflinePhoto(photoFile.path, fileName);
     }
+
+    return null;
   }
 
   static Future<void> _enqueueOfflinePhoto(String filePath, String fileName) async {
@@ -638,7 +577,6 @@ class StorageAndCloudService {
     return (prefs.getStringList(_queuePrefsKey) ?? []).length;
   }
 
-  /// Synchronise en arrière-plan toutes les photos en attente dès que le Wi-Fi est rétabli
   static Future<int> flushOfflineQueue(String webhookUrl) async {
     if (webhookUrl.trim().isEmpty) return 0;
 
@@ -652,12 +590,12 @@ class StorageAndCloudService {
     for (final String itemJson in queue) {
       try {
         final Map<String, dynamic> map = jsonDecode(itemJson) as Map<String, dynamic>;
-        final bool ok = await _sendFileToWebhook(
-          filePath: map['path'] as String,
+        final String? url = await uploadAndRetrieveDirectUrl(
+          photoFile: File(map['path'] as String),
           fileName: map['filename'] as String,
           webhookUrl: webhookUrl.trim(),
         );
-        if (ok) {
+        if (url != null) {
           syncedCount++;
         } else {
           remaining.add(itemJson);
@@ -671,7 +609,7 @@ class StorageAndCloudService {
 }
 
 // ============================================================================
-// ÉCRAN PRINCIPAL DU PHOTOBOOTH (KIOSQUE / LIVE PREVIEW / RÉSULTAT)
+// ÉCRAN PRINCIPAL KIOSQUE & RÉSULTAT AVEC QR CODE
 // ============================================================================
 
 class PhotoboothKioskScreen extends StatefulWidget {
@@ -693,20 +631,19 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
   BoothConfig _config = const BoothConfig();
   final SoundEffectsService _soundService = SoundEffectsService();
 
-  // États du workflow de prise de vue
   bool _isCountingDown = false;
   int _currentCountdownValue = 0;
   bool _showWhiteFlash = false;
   bool _isProcessingImage = false;
 
-  // États de l'écran de résultat (6 secondes)
+  // États du résultat & QR Code
   Uint8List? _finalResultJpegBytes;
   File? _lastSavedFile;
+  String? _uploadedPhotoUrl;
+  bool _isUploadingForQr = false;
+
   Timer? _resultReturnTimer;
   double _resultProgress = 1.0;
-  static const int _resultDisplayDurationSeconds = 6;
-
-  // Timer pour l'appui long de 4 secondes (Back-office Administrateur)
   Timer? _adminHoldTimer;
 
   @override
@@ -739,7 +676,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     }
   }
 
-  /// Charge les préférences administrateur, les cadres PNG et démarre la caméra
   Future<void> _initializeBooth() async {
     await _loadConfigFromPrefs();
     final List<FrameItem> frames = await FrameAssetsManager.loadAllFrames();
@@ -750,7 +686,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     }
     await _setupCamera();
 
-    // Tentative de synchronisation silencieuse des photos en file d'attente au démarrage
     if (_config.webhookUrl.isNotEmpty) {
       unawaited(StorageAndCloudService.flushOfflineQueue(_config.webhookUrl));
     }
@@ -765,6 +700,7 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
         useFrontCamera: prefs.getBool('cfg_use_front_cam') ?? true,
         isMirrored: prefs.getBool('cfg_is_mirrored') ?? true,
         adminPin: prefs.getString('cfg_admin_pin') ?? '1031',
+        resultDurationSeconds: prefs.getInt('cfg_result_dur_sec') ?? 12,
       );
     });
   }
@@ -776,6 +712,7 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     await prefs.setBool('cfg_use_front_cam', newConfig.useFrontCamera);
     await prefs.setBool('cfg_is_mirrored', newConfig.isMirrored);
     await prefs.setString('cfg_admin_pin', newConfig.adminPin);
+    await prefs.setInt('cfg_result_dur_sec', newConfig.resultDurationSeconds);
 
     final bool cameraChanged = _config.useFrontCamera != newConfig.useFrontCamera;
     setState(() {
@@ -787,7 +724,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     }
   }
 
-  /// Initialise le flux vidéo HD de la caméra sélectionnée (Frontale ou Arrière)
   Future<void> _setupCamera() async {
     if (globalAvailableCameras.isEmpty) {
       setState(() {
@@ -838,7 +774,7 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
   }
 
   // ==========================================================================
-  // DÉCOMPTE VISUEL (3, 2, 1), FLASH ÉCRAN 150 MS ET CAPTURE PHOTO
+  // DÉCOMPTE, CAPTURE, FUSION ET GÉNÉRATION DU QR CODE
   // ==========================================================================
 
   Future<void> _startCountdownAndCapture() async {
@@ -853,9 +789,10 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     setState(() {
       _isCountingDown = true;
       _currentCountdownValue = _config.countdownSeconds;
+      _uploadedPhotoUrl = null;
+      _isUploadingForQr = false;
     });
 
-    // Boucle de décompte seconde par seconde avec bip sonore et animation d'échelle
     for (int i = _config.countdownSeconds; i >= 1; i--) {
       if (!mounted) return;
       setState(() {
@@ -867,7 +804,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
 
     if (!mounted) return;
 
-    // À 0 : Simulation du flash blanc plein écran à 100% d'opacité pendant 150 ms + son d'obturateur
     setState(() {
       _isCountingDown = false;
       _showWhiteFlash = true;
@@ -883,12 +819,10 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     });
 
     try {
-      // Capture matérielle via cameraController.takePicture()
       final XFile rawPicture = await _cameraController!.takePicture();
       final Uint8List rawBytes = await rawPicture.readAsBytes();
       final Uint8List selectedFrameBytes = _frames[_selectedFrameIndex].pngBytes;
 
-      // Exécution du moteur de fusion graphique en tâche de fond (Isolate)
       final Uint8List mergedJpegBytes = await compute(
         processAndMergePhotoIsolate,
         ImageMergeJob(
@@ -900,32 +834,40 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
       );
 
       final String fileName = 'halloween_${DateTime.now().millisecondsSinceEpoch}.jpg';
-
-      // Sauvegarde locale asynchrone et synchronisation Cloud Google Drive en tâche de fond
-      StorageAndCloudService.savePhotoToLocalGallery(mergedJpegBytes, fileName)
-          .then((File savedFile) {
-        _lastSavedFile = savedFile;
-        unawaited(
-          StorageAndCloudService.uploadOrQueuePhoto(
-            photoFile: savedFile,
-            fileName: fileName,
-            webhookUrl: _config.webhookUrl,
-          ),
-        );
-      });
+      final File savedFile = await StorageAndCloudService.savePhotoToLocalGallery(
+        mergedJpegBytes,
+        fileName,
+      );
 
       if (!mounted) return;
 
-      // Affichage de l'écran de résultat pendant 6 secondes
       setState(() {
         _isProcessingImage = false;
         _finalResultJpegBytes = mergedJpegBytes;
+        _lastSavedFile = savedFile;
         _resultProgress = 1.0;
+        _isUploadingForQr = _config.webhookUrl.isNotEmpty;
       });
 
       _startResultAutoReturnTimer();
+
+      // Téléversement immédiat pour récupérer l'URL et afficher le QR Code
+      if (_config.webhookUrl.isNotEmpty) {
+        StorageAndCloudService.uploadAndRetrieveDirectUrl(
+          photoFile: savedFile,
+          fileName: fileName,
+          webhookUrl: _config.webhookUrl,
+        ).then((String? directUrl) {
+          if (mounted && _finalResultJpegBytes != null) {
+            setState(() {
+              _uploadedPhotoUrl = directUrl;
+              _isUploadingForQr = false;
+            });
+          }
+        });
+      }
     } catch (e) {
-      debugPrint('Erreur lors de la capture ou de la fusion : $e');
+      debugPrint('Erreur capture/fusion : $e');
       if (mounted) {
         setState(() {
           _isProcessingImage = false;
@@ -935,11 +877,10 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     }
   }
 
-  /// Compte à rebours de 6 secondes sur l'écran de résultat avant retour au Live View
   void _startResultAutoReturnTimer() {
     _resultReturnTimer?.cancel();
     const int tickMs = 50;
-    const int totalMs = _resultDisplayDurationSeconds * 1000;
+    final int totalMs = _config.resultDurationSeconds * 1000;
     int elapsedMs = 0;
 
     _resultReturnTimer = Timer.periodic(const Duration(milliseconds: tickMs), (timer) {
@@ -961,7 +902,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     });
   }
 
-  /// Revient à l'écran de prise de vue (et supprime le fichier local si l'invité clique sur "Reprendre")
   Future<void> _resetToLiveView({required bool deleteLastPhoto}) async {
     _resultReturnTimer?.cancel();
 
@@ -977,13 +917,15 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
       setState(() {
         _finalResultJpegBytes = null;
         _lastSavedFile = null;
+        _uploadedPhotoUrl = null;
+        _isUploadingForQr = false;
         _resultProgress = 1.0;
       });
     }
   }
 
   // ==========================================================================
-  // ACCÈS SÉCURISÉ AU BACK-OFFICE ADMINISTRATEUR (APPUI LONG 4 SECONDES)
+  // BACK-OFFICE ADMINISTRATEUR (4 SECONDES COIN HAUT DROIT)
   // ==========================================================================
 
   void _onAdminCornerTouchDown(TapDownDetails details) {
@@ -1110,12 +1052,11 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
       },
     );
 
-    // Réactivation du mode immersif après la fermeture du clavier administrateur
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   }
 
   // ==========================================================================
-  // CONSTRUCTION DE L'INTERFACE GRAPHIQUE (UI)
+  // INTERFACE UTILISATEUR
   // ==========================================================================
 
   @override
@@ -1125,19 +1066,15 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // 1. Contenu principal : Écran de Résultat OU Live Preview avec cadre superposé
           if (_finalResultJpegBytes != null)
-            _buildResultView()
+            _buildResultViewWithQr()
           else
             _buildLivePreviewAndControls(),
 
-          // 2. Décompte animé au centre (3, 2, 1)
           if (_isCountingDown) _buildAnimatedCountdownOverlay(),
 
-          // 3. Indicateur de fusion matricielle HD en cours
           if (_isProcessingImage) _buildProcessingOverlay(),
 
-          // 4. Simulation du Flash blanc 100% d'opacité pendant 150 ms
           if (_showWhiteFlash)
             Container(
               color: Colors.white,
@@ -1145,7 +1082,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
               height: double.infinity,
             ),
 
-          // 5. Zone invisible dans le coin supérieur droit (Appui long de 4 secondes)
           Positioned(
             top: 0,
             right: 0,
@@ -1165,13 +1101,10 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     );
   }
 
-  /// Construit la vue Live Preview avec le cadre PNG en superposition exacte (3:4)
-  /// et le sélecteur horizontal de miniatures en bas d'écran.
   Widget _buildLivePreviewAndControls() {
     return SafeArea(
       child: Column(
         children: [
-          // En-tête festif Halloween
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
             child: Row(
@@ -1201,8 +1134,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
               ],
             ),
           ),
-
-          // Zone Centrale : Aperçu Caméra + Superposition exacte du Cadre PNG (Ratio 3:4)
           Expanded(
             child: Center(
               child: Padding(
@@ -1230,10 +1161,7 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
                       child: Stack(
                         fit: StackFit.expand,
                         children: [
-                          // Flux vidéo en direct de la caméra avec effet miroir configurable
                           _buildCameraFeedWidget(),
-
-                          // Superposition exacte (Stack) du cadre PNG sélectionné avec transparence
                           if (_frames.isNotEmpty)
                             IgnorePointer(
                               child: Image.memory(
@@ -1250,10 +1178,7 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
               ),
             ),
           ),
-
           const SizedBox(height: 12),
-
-          // Sélecteur horizontal scrollable des miniatures de cadres PNG
           SizedBox(
             height: 104,
             child: ListView.builder(
@@ -1328,10 +1253,7 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
               },
             ),
           ),
-
           const SizedBox(height: 14),
-
-          // Gros bouton tactile circulaire au centre pour déclencher la photo
           Padding(
             padding: const EdgeInsets.only(bottom: 18),
             child: GestureDetector(
@@ -1375,7 +1297,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     );
   }
 
-  /// Rendu du flux vidéo caméra mis à l'échelle pour remplir le canevas 3:4 avec effet miroir
   Widget _buildCameraFeedWidget() {
     if (_cameraError != null) {
       return Center(
@@ -1429,7 +1350,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     );
   }
 
-  /// Superposition du décompte (3, 2, 1) avec animation d'échelle (Scale)
   Widget _buildAnimatedCountdownOverlay() {
     return Container(
       color: Colors.black45,
@@ -1476,7 +1396,6 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     );
   }
 
-  /// Superposition pendant la fusion matricielle du PNG avec la photo
   Widget _buildProcessingOverlay() {
     return Container(
       color: Colors.black87,
@@ -1494,7 +1413,7 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
           ),
           const SizedBox(height: 24),
           Text(
-            'Préparation de votre souvenir d\'Halloween...',
+            'Création du souvenir et du QR Code...',
             style: TextStyle(
               fontSize: 20,
               fontWeight: FontWeight.bold,
@@ -1512,13 +1431,14 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
     );
   }
 
-  /// Écran de résultat affiché pendant 6 secondes avec barre de progression et bouton "Reprendre"
-  Widget _buildResultView() {
-    final int secondsLeft = (_resultProgress * _resultDisplayDurationSeconds).ceil();
+  /// Écran de résultat avec affichage de la photo et du QR Code Google Drive
+  Widget _buildResultViewWithQr() {
+    final int secondsLeft =
+        (_resultProgress * _config.resultDurationSeconds).ceil();
 
     return SafeArea(
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         child: Column(
           children: [
             const Text(
@@ -1526,58 +1446,86 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
               style: TextStyle(
                 fontSize: 24,
                 fontWeight: FontWeight.w900,
-                letterSpacing: 1.8,
+                letterSpacing: 2,
                 color: HalloweenColors.pumpkinOrange,
               ),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
 
-            // Photo finale encadrée (Ratio 3:4)
+            // Zone centrale : Photo et QR Code
             Expanded(
-              child: Center(
-                child: AspectRatio(
-                  aspectRatio: 3 / 4,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(22),
-                      border: Border.all(
-                        color: HalloweenColors.pumpkinOrange,
-                        width: 3,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: HalloweenColors.pumpkinOrange.withOpacity(0.4),
-                          blurRadius: 24,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  // Sur tablette large (mode portrait ou grand écran)
+                  final bool isWide = constraints.maxWidth > 550;
+
+                  final Widget photoWidget = AspectRatio(
+                    aspectRatio: 3 / 4,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: HalloweenColors.pumpkinOrange,
+                          width: 3,
                         ),
-                      ],
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(19),
-                      child: Image.memory(
-                        _finalResultJpegBytes!,
-                        fit: BoxFit.contain,
+                        boxShadow: [
+                          BoxShadow(
+                            color: HalloweenColors.pumpkinOrange.withOpacity(0.4),
+                            blurRadius: 20,
+                          ),
+                        ],
+                      ),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(17),
+                        child: Image.memory(
+                          _finalResultJpegBytes!,
+                          fit: BoxFit.contain,
+                        ),
                       ),
                     ),
-                  ),
-                ),
+                  );
+
+                  final Widget qrWidget = _buildQrCodeContainer();
+
+                  if (isWide) {
+                    return Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        Flexible(flex: 3, child: photoWidget),
+                        const SizedBox(width: 24),
+                        Flexible(flex: 2, child: qrWidget),
+                      ],
+                    );
+                  } else {
+                    return Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Expanded(child: photoWidget),
+                        const SizedBox(height: 12),
+                        qrWidget,
+                      ],
+                    );
+                  }
+                },
               ),
             ),
 
-            const SizedBox(height: 18),
+            const SizedBox(height: 14),
 
-            // Barre de progression avant retour automatique à l'écran de départ
+            // Barre de compte à rebours
             Column(
               children: [
                 Text(
-                  'Retour automatique pour l\'invité suivant dans $secondsLeft s...',
-                  style: const TextStyle(color: Colors.white70, fontSize: 15),
+                  'Prêt pour l\'invité suivant dans $secondsLeft s...',
+                  style: const TextStyle(color: Colors.white70, fontSize: 14),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 6),
                 ClipRRect(
-                  borderRadius: BorderRadius.circular(10),
+                  borderRadius: BorderRadius.circular(8),
                   child: LinearProgressIndicator(
                     value: _resultProgress,
-                    minHeight: 10,
+                    minHeight: 8,
                     backgroundColor: HalloweenColors.darkPurple,
                     valueColor: const AlwaysStoppedAnimation<Color>(
                       HalloweenColors.pumpkinOrange,
@@ -1587,12 +1535,12 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
               ],
             ),
 
-            const SizedBox(height: 18),
+            const SizedBox(height: 14),
 
-            // Bouton "Reprendre" (efface la photo et revient immédiatement au Live View)
+            // Bouton Reprendre
             SizedBox(
-              width: 240,
-              height: 56,
+              width: 220,
+              height: 50,
               child: ElevatedButton.icon(
                 style: ElevatedButton.styleFrom(
                   backgroundColor: HalloweenColors.darkPurple,
@@ -1602,27 +1550,139 @@ class _PhotoboothKioskScreenState extends State<PhotoboothKioskScreen>
                     width: 2,
                   ),
                   shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
+                    borderRadius: BorderRadius.circular(14),
                   ),
                 ),
                 onPressed: () => _resetToLiveView(deleteLastPhoto: true),
                 icon: const Icon(Icons.refresh, color: HalloweenColors.pumpkinOrange),
                 label: const Text(
                   'Reprendre',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                 ),
               ),
             ),
-            const SizedBox(height: 10),
           ],
         ),
+      ),
+    );
+  }
+
+  /// Conteneur du QR Code à fond blanc contrasté pour un scan instantané
+  Widget _buildQrCodeContainer() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: HalloweenColors.surfaceAnthracite,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: HalloweenColors.pumpkinOrange.withOpacity(0.7),
+          width: 2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: HalloweenColors.pumpkinOrange.withOpacity(0.2),
+            blurRadius: 16,
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text(
+            'RÉCUPÈRE TA PHOTO',
+            style: TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 1.2,
+              color: HalloweenColors.pumpkinOrange,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Scanne avec ton smartphone',
+            style: TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+          const SizedBox(height: 10),
+
+          // État du QR Code : Chargement / Affichage / Hors-ligne
+          if (_isUploadingForQr) ...[
+            Container(
+              width: 140,
+              height: 140,
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(
+                    color: HalloweenColors.pumpkinOrange,
+                    strokeWidth: 3,
+                  ),
+                  SizedBox(height: 10),
+                  Text(
+                    'Envoi Cloud...',
+                    style: TextStyle(
+                      color: Colors.black87,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ] else if (_uploadedPhotoUrl != null && _uploadedPhotoUrl!.isNotEmpty) ...[
+            Container(
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(12),
+                boxShadow: const [
+                  BoxShadow(color: Colors.black45, blurRadius: 8),
+                ],
+              ),
+              padding: const EdgeInsets.all(8),
+              child: QrImageView(
+                data: _uploadedPhotoUrl!,
+                version: QrVersions.auto,
+                size: 140.0,
+                backgroundColor: Colors.white,
+                padding: EdgeInsets.zero,
+                errorCorrectionLevel: QrErrorCorrectLevel.M,
+              ),
+            ),
+          ] else ...[
+            Container(
+              width: 140,
+              height: 140,
+              decoration: BoxDecoration(
+                color: HalloweenColors.darkPurple,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.white24),
+              ),
+              padding: const EdgeInsets.all(10),
+              child: const Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.check_circle_outline, color: Colors.greenAccent, size: 36),
+                  SizedBox(height: 6),
+                  Text(
+                    'Enregistré en galerie',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 11, color: Colors.white),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
 }
 
 // ============================================================================
-// PANNEAU DE CONFIGURATION BACK-OFFICE ADMINISTRATEUR
+// MODALE D'ADMINISTRATION
 // ============================================================================
 
 class AdminSettingsSheet extends StatefulWidget {
@@ -1646,6 +1706,7 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
   late int _countdownSeconds;
   late bool _useFrontCamera;
   late bool _isMirrored;
+  late int _resultDurationSeconds;
   late int _pendingCount;
   bool _isSyncingQueue = false;
 
@@ -1656,6 +1717,7 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
     _countdownSeconds = widget.initialConfig.countdownSeconds;
     _useFrontCamera = widget.initialConfig.useFrontCamera;
     _isMirrored = widget.initialConfig.isMirrored;
+    _resultDurationSeconds = widget.initialConfig.resultDurationSeconds;
     _pendingCount = widget.pendingQueueCount;
   }
 
@@ -1716,9 +1778,8 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
             ),
             const Divider(color: Colors.white24, height: 28),
 
-            // 1. URL du Webhook Google Apps Script
             const Text(
-              'URL du Webhook Google Apps Script (Google Drive) :',
+              'URL du Webhook Google Apps Script (Drive) :',
               style: TextStyle(fontWeight: FontWeight.w600, color: Colors.white70),
             ),
             const SizedBox(height: 8),
@@ -1735,14 +1796,44 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
                 ),
               ),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 18),
 
-            // 2. Durée du compte à rebours (3, 5 ou 10 secondes)
             const Text(
-              'Temps du compte à rebours :',
+              'Durée d\'affichage du résultat & QR Code :',
               style: TextStyle(fontWeight: FontWeight.w600, color: Colors.white70),
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 8),
+            Row(
+              children: [8, 12, 16].map((int sec) {
+                final bool selected = _resultDurationSeconds == sec;
+                return Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: ChoiceChip(
+                      label: Text('$sec s'),
+                      selected: selected,
+                      selectedColor: HalloweenColors.pumpkinOrange,
+                      labelStyle: TextStyle(
+                        color: selected ? Colors.black : Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      onSelected: (_) {
+                        setState(() {
+                          _resultDurationSeconds = sec;
+                        });
+                      },
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 18),
+
+            const Text(
+              'Temps du décompte avant prise de vue :',
+              style: TextStyle(fontWeight: FontWeight.w600, color: Colors.white70),
+            ),
+            const SizedBox(height: 8),
             Row(
               children: [3, 5, 10].map((int sec) {
                 final bool selected = _countdownSeconds == sec;
@@ -1750,7 +1841,7 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 4),
                     child: ChoiceChip(
-                      label: Text('$sec secondes'),
+                      label: Text('$sec s'),
                       selected: selected,
                       selectedColor: HalloweenColors.pumpkinOrange,
                       labelStyle: TextStyle(
@@ -1767,18 +1858,13 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
                 );
               }).toList(),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 14),
 
-            // 3. Basculer entre Caméra Frontale et Caméra Arrière
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               activeColor: HalloweenColors.pumpkinOrange,
               secondary: const Icon(Icons.cameraswitch, color: HalloweenColors.pumpkinOrange),
               title: const Text('Utiliser la caméra frontale'),
-              subtitle: Text(
-                _useFrontCamera ? 'Mode Selfie (Caméra avant)' : 'Caméra arrière active',
-                style: const TextStyle(color: Colors.white54),
-              ),
               value: _useFrontCamera,
               onChanged: (bool val) {
                 setState(() {
@@ -1787,16 +1873,11 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
               },
             ),
 
-            // 4. Activer / Désactiver l'effet miroir
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               activeColor: HalloweenColors.pumpkinOrange,
               secondary: const Icon(Icons.flip, color: HalloweenColors.pumpkinOrange),
-              title: const Text('Activer l\'effet miroir'),
-              subtitle: const Text(
-                'Inverse horizontalement l\'aperçu et la photo finale',
-                style: TextStyle(color: Colors.white54),
-              ),
+              title: const Text('Effet miroir'),
               value: _isMirrored,
               onChanged: (bool val) {
                 setState(() {
@@ -1807,19 +1888,12 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
 
             const Divider(color: Colors.white24, height: 24),
 
-            // 5. État de la file d'attente hors-ligne
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Row(
-                  children: [
-                    const Icon(Icons.cloud_queue, color: Colors.white70),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Photos en attente de réseau : $_pendingCount',
-                      style: const TextStyle(color: Colors.white70),
-                    ),
-                  ],
+                Text(
+                  'Photos en attente réseau : $_pendingCount',
+                  style: const TextStyle(color: Colors.white70),
                 ),
                 TextButton.icon(
                   onPressed: _isSyncingQueue ? null : _forceOfflineQueueSync,
@@ -1837,10 +1911,8 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
                 ),
               ],
             ),
+            const SizedBox(height: 18),
 
-            const SizedBox(height: 20),
-
-            // Bouton d'enregistrement
             SizedBox(
               width: double.infinity,
               height: 52,
@@ -1858,6 +1930,7 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
                     countdownSeconds: _countdownSeconds,
                     useFrontCamera: _useFrontCamera,
                     isMirrored: _isMirrored,
+                    resultDurationSeconds: _resultDurationSeconds,
                   );
                   await widget.onSave(updated);
                   if (context.mounted) {
@@ -1866,7 +1939,7 @@ class _AdminSettingsSheetState extends State<AdminSettingsSheet> {
                 },
                 icon: const Icon(Icons.save),
                 label: const Text(
-                  'Enregistrer la configuration',
+                  'Enregistrer',
                   style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                 ),
               ),
