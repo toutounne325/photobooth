@@ -16,6 +16,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Verifier la presence de main.dart
+        run: |
+          if [ ! -f "main.dart" ]; then
+            echo "::error::Le fichier main.dart est INTROUVABLE a la racine du depot GitHub !"
+            echo "Veuillez creer le fichier main.dart a la racine et y coller le code Flutter."
+            exit 1
+          fi
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -27,10 +35,11 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create Flutter project and configure Android permissions
+      - name: Preparer le projet Flutter et les permissions
         run: |
           flutter create --platforms=android --org com.piratepips halloween_photobooth
           cp main.dart halloween_photobooth/lib/main.dart
+
           mkdir -p halloween_photobooth/assets/frames
           mkdir -p halloween_photobooth/assets/audio
           if [ -d "assets/frames" ]; then cp -r assets/frames/* halloween_photobooth/assets/frames/ || true; fi
@@ -38,25 +47,41 @@ jobs:
 
           cd halloween_photobooth
 
-          # Injection des permissions matérielles dans AndroidManifest.xml
-          sed -i 's/<application/<uses-permission android:name="android.permission.CAMERA" \/>\n    <uses-permission android:name="android.permission.INTERNET" \/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" \/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" \/>\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" \/>\n    <application/g' android/app/src/main/AndroidManifest.xml
+          # Injection securisee des permissions dans AndroidManifest.xml via Python
+          python3 -c "
+          manifest_path = 'android/app/src/main/AndroidManifest.xml'
+          with open(manifest_path, 'r', encoding='utf-8') as f:
+              content = f.read()
 
-          # Configuration minSdk = 21 et compileSdk = 34
-          sed -i 's/minSdkVersion .*/minSdkVersion 21/g' android/app/build.gradle || true
-          sed -i 's/minSdk = .*/minSdk = 21/g' android/app/build.gradle || true
-          sed -i 's/minSdk = .*/minSdk = 21/g' android/app/build.gradle.kts || true
-          sed -i 's/compileSdkVersion .*/compileSdkVersion 34/g' android/app/build.gradle || true
-          sed -i 's/compileSdk = .*/compileSdk = 34/g' android/app/build.gradle || true
-          sed -i 's/compileSdk = .*/compileSdk = 34/g' android/app/build.gradle.kts || true
+          permissions = '''
+              <uses-permission android:name=\"android.permission.CAMERA\" />
+              <uses-permission android:name=\"android.permission.INTERNET\" />
+              <uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\" />
+              <uses-permission android:name=\"android.permission.WRITE_EXTERNAL_STORAGE\" android:maxSdkVersion=\"29\" />
+              <uses-permission android:name=\"android.permission.READ_EXTERNAL_STORAGE\" android:maxSdkVersion=\"32\" />
+              <uses-permission android:name=\"android.permission.READ_MEDIA_IMAGES\" />
+          '''
 
-          # Installation automatique des dépendances
-          flutter pub add camera image path_provider http shared_preferences audioplayers
+          if '<uses-permission' not in content:
+              content = content.replace('<application', permissions + '    <application')
+              with open(manifest_path, 'w', encoding='utf-8') as f:
+                  f.write(content)
+          "
 
-      - name: Build Release APK
+          # Configuration universelle minSdk = 21 et compileSdk = 34 (Groovy & Kotlin DSL)
+          find android/app -name "build.gradle*" -exec sed -i 's/minSdkVersion .*/minSdkVersion 21/g' {} +
+          find android/app -name "build.gradle*" -exec sed -i 's/minSdk = .*/minSdk = 21/g' {} +
+          find android/app -name "build.gradle*" -exec sed -i 's/compileSdkVersion .*/compileSdkVersion 34/g' {} +
+          find android/app -name "build.gradle*" -exec sed -i 's/compileSdk = .*/compileSdk = 34/g' {} +
+
+          # Installation automatique de l'ensemble des dependances
+          flutter pub add camera image path_provider http shared_preferences audioplayers qr_flutter
+
+      - name: Compiler le fichier APK Release
         working-directory: halloween_photobooth
-        run: flutter build apk --release
+        run: flutter build apk --release --no-tree-shake-icons
 
-      - name: Upload Compiled APK Artifact
+      - name: Televerser l'APK compile
         uses: actions/upload-artifact@v4
         with:
           name: Halloween-Photobooth-APK
