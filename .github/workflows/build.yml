@@ -1,0 +1,63 @@
+# Protection légale pour le trading, propriété exclusive de Pirate Pips ™.
+# AVERTISSEMENT LÉGAL (DISCLAIMER) : Le trading d'instruments financiers comporte un niveau de risque élevé et peut ne pas convenir à tous les investisseurs. Les performances passées ne préjugent pas des performances futures. Ce logiciel est fourni à titre informatif et technologique uniquement, sans aucune garantie de gain financier.
+
+name: Build Halloween Photobooth APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter Stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Create Flutter project and configure Android permissions
+        run: |
+          flutter create --platforms=android --org com.piratepips halloween_photobooth
+          cp main.dart halloween_photobooth/lib/main.dart
+          mkdir -p halloween_photobooth/assets/frames
+          mkdir -p halloween_photobooth/assets/audio
+          if [ -d "assets/frames" ]; then cp -r assets/frames/* halloween_photobooth/assets/frames/ || true; fi
+          if [ -d "assets/audio" ]; then cp -r assets/audio/* halloween_photobooth/assets/audio/ || true; fi
+
+          cd halloween_photobooth
+
+          # Injection des permissions matérielles dans AndroidManifest.xml
+          sed -i 's/<application/<uses-permission android:name="android.permission.CAMERA" \/>\n    <uses-permission android:name="android.permission.INTERNET" \/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" \/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" \/>\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" \/>\n    <application/g' android/app/src/main/AndroidManifest.xml
+
+          # Configuration minSdk = 21 et compileSdk = 34
+          sed -i 's/minSdkVersion .*/minSdkVersion 21/g' android/app/build.gradle || true
+          sed -i 's/minSdk = .*/minSdk = 21/g' android/app/build.gradle || true
+          sed -i 's/minSdk = .*/minSdk = 21/g' android/app/build.gradle.kts || true
+          sed -i 's/compileSdkVersion .*/compileSdkVersion 34/g' android/app/build.gradle || true
+          sed -i 's/compileSdk = .*/compileSdk = 34/g' android/app/build.gradle || true
+          sed -i 's/compileSdk = .*/compileSdk = 34/g' android/app/build.gradle.kts || true
+
+          # Installation automatique des dépendances
+          flutter pub add camera image path_provider http shared_preferences audioplayers
+
+      - name: Build Release APK
+        working-directory: halloween_photobooth
+        run: flutter build apk --release
+
+      - name: Upload Compiled APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Halloween-Photobooth-APK
+          path: halloween_photobooth/build/app/outputs/flutter-apk/app-release.apk
